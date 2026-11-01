@@ -1,0 +1,256 @@
+#!/bin/bash
+
+# omarchy:summary=Print active network status for the shell
+# omarchy:group=network
+# omarchy:args=[--verbose] [--iface <name>]
+
+verbose=false
+internet_probe=1.1.1.1
+want_iface=""
+
+while (($#)); do
+  case "$1" in
+    --verbose)
+      verbose=true
+      shift
+      ;;
+    --iface)
+      if [[ -z ${2:-} ]]; then
+        echo "Usage: omarchy-network-status [--verbose] [--iface <name>]" >&2
+        exit 2
+      fi
+      want_iface=$2
+      shift 2
+      ;;
+    *)
+      echo "Usage: omarchy-network-status [--verbose] [--iface <name>]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+# Interface names are a single path segment under /sys/class/net. Reject
+# anything else so the name cannot walk out of that directory.
+iface_ok() {
+  [[ $1 =~ ^[A-Za-z0-9._-]+$ && -d /sys/class/net/$1 ]]
+}
+
+# The panel can pin a specific interface so a multi-NIC machine reports the
+# adapter the user is looking at rather than whichever one owns the default
+# route. Unpinned callers keep the route-derived behaviour exactly as before.
+route_device() {
+  ip route get "$internet_probe" 2>/dev/null |
+    awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
+selected_device() {
+  if [[ -n $want_iface ]]; then
+    # A pinned interface that has gone away is reported as disconnected rather
+    # than silently falling back to a different adapter.
+    if iface_ok "$want_iface"; then
+      printf '%s\n' "$want_iface"
+    fi
+    return
+  fi
+
+  route_device
+}
+
+print_status() {
+  local device nm state ssid signal freq
+
+  device=$(selected_device)
+
+  if [[ -z $device ]]; then
+    printf 'disconnected\t\t\t\n'
+    return
+  fi
+
+  if [[ ! -d /sys/class/net/$device/wireless ]]; then
+    printf 'ethernet\t%s\t\t\n' "$device"
+    return
+  fi
+
+  if omarchy-cmd-present nmcli; then
+    nm=$(nmcli -t -f GENERAL.STATE,GENERAL.CONNECTION dev show "$device" 2>/dev/null)
+    state=$(awk -F: '$1 == "GENERAL.STATE" { print $2; exit }' <<<"$nm")
+    ssid=$(awk -F: '$1 == "GENERAL.CONNECTION" { print $2; exit }' <<<"$nm")
+    signal=$(nmcli -t -f IN-USE,SIGNAL dev wifi list ifname "$device" --rescan no 2>/dev/null | awk -F: '$1 == "*" { print $2; exit }')
+    freq=$(iw dev "$device" link 2>/dev/null | awk '/freq:/ { print $2; exit }')
+
+    if [[ $state != 100* ]]; then
+      printf 'disconnected\t\t\t\n'
+      return
+    fi
+
+    printf 'wifi\t%s\t%s\t%s\n' "${ssid:-$device}" "$signal" "$freq"
+    return
+  fi
+
+  printf 'wifi\t%s\t\t\n' "$device"
+}
+
+ping_latency_ms() {
+  local host=$1
+  local iface=${2:-}
+  local args=(-n -c 1 -W 1)
+
+  # A selected adapter may not own the default route. Bind the probe to that
+  # interface so the sample describes the adapter the panel is showing.
+  # Unpinned callers leave the interface empty and keep the unbound ping.
+  [[ -n $iface ]] && args+=(-I "$iface")
+  LC_ALL=C ping "${args[@]}" "$host" 2>/dev/null |
+    awk -F'time[=<]' '/time[=<]/ { split($2, parts, " "); print parts[1]; exit }'
+}
+
+# Desktop posture sends this user's TCP through the tun. The transport
+# radio itself has no internet ICMP path, so ping -I on that interface
+# times out even while the tunnel is carrying traffic. The tun also
+# completes the TCP handshake locally, so a bare connect time is not a
+# measurement. The sample is the time to the first byte from the probe.
+tunnel_transport_iface() {
+  local state=/run/netshare/state
+  [[ -r $state ]] || return 1
+  local posture="" iface="" pid="" installed=""
+  local line key value
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == *=* ]] || continue
+    key=${line%%=*}
+    value=${line#*=}
+    case $key in
+      posture) posture=$value ;;
+      iface) iface=$value ;;
+      pid) pid=$value ;;
+      default_installed) installed=$value ;;
+    esac
+  done <"$state"
+  [[ $posture == desktop && $installed == 1 && -n $iface ]] || return 1
+  [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/comm ]] || return 1
+  [[ $(tr -d '\n' </proc/$pid/comm) == tun2proxy ]] || return 1
+  printf '%s\n' "$iface"
+}
+
+tunnel_http_ms() {
+  local host=$1
+  local out secs code
+  [[ $host =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  command -v curl >/dev/null || return 1
+  out=$(curl -4 --noproxy '*' -o /dev/null -s \
+    --connect-timeout 2 --max-time 2 \
+    -w '%{time_starttransfer} %{http_code}' \
+    "http://${host}/cdn-cgi/trace" 2>/dev/null) || true
+  secs=${out%% *}
+  code=${out##* }
+  awk -v secs="$secs" -v code="$code" 'BEGIN {
+    if (code ~ /^[23][0-9][0-9]$/ && secs+0 > 0) printf "%.2f\n", secs * 1000
+  }'
+}
+
+print_ping_samples() {
+  local gateway=$1
+  local iface=${2:-}
+  local tmpdir router_file internet_file
+  local router_pid="" internet_pid=""
+
+  omarchy-cmd-present ping || return
+  tmpdir=$(mktemp -d) || return
+  router_file="$tmpdir/router"
+  internet_file="$tmpdir/internet"
+
+  if [[ -n $gateway ]]; then
+    ping_latency_ms "$gateway" "$iface" >"$router_file" &
+    router_pid=$!
+  fi
+
+  # The tunnel's transport radio cannot answer an internet ICMP probe.
+  # Measure that adapter through the tunnel instead of reporting a timeout.
+  local transport=""
+  transport=$(tunnel_transport_iface 2>/dev/null || true)
+  if [[ -n $iface && $iface == "$transport" ]]; then
+    tunnel_http_ms "$internet_probe" >"$internet_file" &
+  else
+    ping_latency_ms "$internet_probe" "$iface" >"$internet_file" &
+  fi
+  internet_pid=$!
+
+  if [[ -n $router_pid ]]; then
+    wait "$router_pid"
+    printf 'router_ping_ms\t%s\n' "$(cat "$router_file")"
+  fi
+
+  wait "$internet_pid"
+  printf 'internet_ping_ms\t%s\n' "$(cat "$internet_file")"
+  rm -rf "$tmpdir"
+}
+
+print_verbose() {
+  local route_json iface gw src prefix link bind_iface=""
+
+  iface=$(selected_device)
+  [[ -z $iface ]] && return
+
+  # For the routed interface, `ip route get` is the cheapest source of both the
+  # gateway and the preferred source address. A pinned interface that is not
+  # the default route needs its own lookup instead, since the route to the
+  # probe address says nothing about it.
+  if [[ -n $want_iface && $want_iface != "$(route_device)" ]]; then
+    src=$(ip -j addr show "$iface" 2>/dev/null |
+      jq -r '.[0].addr_info[]? | select(.family == "inet") | .local // ""' 2>/dev/null | head -n 1)
+    gw=$(ip -j route show default dev "$iface" 2>/dev/null |
+      jq -r '.[0].gateway // ""' 2>/dev/null)
+    bind_iface=$iface
+  else
+    route_json=$(ip -j route get "$internet_probe" 2>/dev/null)
+    [[ -z $route_json ]] && return
+
+    gw=$(jq -r '.[0].gateway // ""' <<<"$route_json" 2>/dev/null)
+    src=$(jq -r '.[0].prefsrc // ""' <<<"$route_json" 2>/dev/null)
+    # An explicit pin of the default-route adapter still binds the probe.
+    if [[ -n $want_iface ]]; then
+      bind_iface=$iface
+    fi
+  fi
+
+  prefix=$(ip -j addr show "$iface" 2>/dev/null | jq -r '.[0].addr_info[]? | select(.family == "inet") | .prefixlen // ""' 2>/dev/null | head -n 1)
+
+  printf 'iface\t%s\n' "$iface"
+  printf 'ip\t%s\n' "$src"
+  printf 'prefix\t%s\n' "$prefix"
+  printf 'gateway\t%s\n' "$gw"
+
+  if [[ -r /sys/class/net/$iface/statistics/rx_bytes ]]; then
+    printf 'rx_bytes\t%s\n' "$(cat /sys/class/net/$iface/statistics/rx_bytes)"
+  fi
+  if [[ -r /sys/class/net/$iface/statistics/tx_bytes ]]; then
+    printf 'tx_bytes\t%s\n' "$(cat /sys/class/net/$iface/statistics/tx_bytes)"
+  fi
+
+  if [[ -d /sys/class/net/$iface/wireless ]]; then
+    printf 'type\twifi\n'
+
+    if omarchy-cmd-present iw; then
+      # A secondary adapter can print the link and then exit non-zero on the
+      # signal ioctl. The captured text is what gets parsed.
+      link=$(iw dev "$iface" link 2>/dev/null || true)
+
+      if [[ -n $link ]]; then
+        printf 'ssid\t%s\n' "$(awk '/SSID:/ { sub(/.*SSID: /, ""); print; exit }' <<<"$link")"
+        printf 'signal_dbm\t%s\n' "$(awk '/signal:/ { print $2; exit }' <<<"$link")"
+        printf 'freq\t%s\n' "$(awk '/freq:/ { print $2; exit }' <<<"$link")"
+        printf 'bitrate\t%s %s\n' "$(awk '/tx bitrate:/ { print $3; exit }' <<<"$link")" "$(awk '/tx bitrate:/ { print $4; exit }' <<<"$link")"
+      fi
+    fi
+  else
+    printf 'type\tethernet\n'
+    [[ -r /sys/class/net/$iface/speed ]] && printf 'speed\t%s\n' "$(cat /sys/class/net/$iface/speed)"
+    [[ -r /sys/class/net/$iface/duplex ]] && printf 'duplex\t%s\n' "$(cat /sys/class/net/$iface/duplex)"
+  fi
+
+  print_ping_samples "$gw" "$bind_iface"
+}
+
+if [[ $verbose == "true" ]]; then
+  print_verbose
+else
+  print_status
+fi
